@@ -8,8 +8,10 @@ as a fedora-review plugin.
 [1] https://fedoraproject.org/wiki/Packaging:Java
 """
 
+import os
 import re
-from FedoraReview import CheckBase, RegistryBase
+from FedoraReview import CheckBase, RegistryBase, Mock, ReviewDirs
+from subprocess import check_output, CalledProcessError
 
 
 class Registry(RegistryBase):
@@ -487,5 +489,63 @@ class CheckNewStyleMaven(JavaCheckBase):
         else:
             self.set_passed(self.NA)
 
+
+class CheckBundling(JavaCheckBase):
+    """Java archives shouldn't link statically to their dependencies"""
+
+    def __init__(self, base):
+        JavaCheckBase.__init__(self, base)
+        self.text = """Java archives shouldn't link statically to their dependencies"""
+        self.url = 'https://fedoraproject.org/wiki/Packaging:No_Bundled_Libraries'
+        self.automatic = True
+        self.type = 'MUST'
+
+    def run(self):
+        cmd = '/usr/bin/bundling-detector-java'
+
+        if not os.path.exists(cmd) or not os.access(cmd, os.X_OK):
+            self.set_passed(self.PENDING, cmd + ' is not available')
+            return
+
+        mock_dir = os.path.join(Mock._get_dir(), 'root')
+        mock_java_dir = os.path.join(mock_dir, Mock._rpm_eval('%{_javadir}')[1:])
+        mock_jni_dir = os.path.join(mock_dir, Mock._rpm_eval('%{_jnidir}')[1:])
+        javadoc_dir = os.path.join(Mock._rpm_eval('%{_javadocdir}'))
+
+        try:
+            with open(os.path.join(ReviewDirs.root, 'files.dir'), 'rb') as f:
+                # list of files in resulting RPMs, excluding javadocs
+                rpm_files = {x.replace('\n', '') for x in f.readlines()
+                             if x.startswith('/') and not x.startswith(javadoc_dir)}
+        except IOError as e:
+            self.set_passed(self.PENDING, str(e))
+            return
+
+        cmd += ' -check '
+        cmd += ' '.join(['\'{f}\''.format(f=os.path.join(mock_dir, x[1:]))
+                         for x in rpm_files])
+        cmd += ' -checkAgainst '
+        cmd += ' '.join([mock_java_dir, mock_jni_dir])
+
+        self.log.debug('Invoking: ' + cmd)
+        try:
+            out = check_output(cmd, shell=True)
+
+            filename = os.path.join(ReviewDirs.root, 'java-bundling-report.txt')
+            with open(filename, 'wb') as output:
+                output.write(out)
+
+            if out:
+                msg = 'There might be bundled classes. See full log in:\n'
+                msg += filename
+                self.set_passed(self.FAIL, msg)
+                return
+
+        except CalledProcessError as e:
+            self.set_passed(self.PENDING, str(e))
+            return
+
+        # no bundling detected
+        self.set_passed(self.PASS)
 
 # vim: set expandtab ts=4 sw=4:
